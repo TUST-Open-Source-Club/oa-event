@@ -190,6 +190,9 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/healthz", axum::routing::get(routes::healthz))
         .route("/readyz", axum::routing::get(routes::readyz))
         .nest("/api/v1/event", routes::router())
+        .layer(axum::middleware::from_fn(|req, next| {
+            club_auth_sdk::guard::guard_bot_request(req, next, "event")
+        }))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
