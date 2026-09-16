@@ -284,6 +284,120 @@ async fn load_event_for_admin(
     Ok(model)
 }
 
+/// `GET /events/{id}/changes`：活动操作记录。
+pub async fn list_event_changes(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(event_id): Path<Uuid>,
+) -> Result<Json<Vec<club_bus::audit::ChangeEntry>>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    load_event_for_admin(&state, user_id, event_id).await?;
+    let items = club_bus::audit::list_for(&state.db, "event", &event_id.to_string(), 50)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(items))
+}
+
+/// 从快照读取字符串字段。
+fn snap_str(snapshot: &Value, key: &str) -> Option<String> {
+    snapshot.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// `POST /changes/{id}/undo`：撤销活动编辑或表单变更。
+pub async fn undo_change(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(change_id): Path<Uuid>,
+) -> Result<Json<EventDto>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let entry = club_bus::audit::find(&state.db, change_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("EVENT_CHANGE_NOT_FOUND", "变更记录不存在"))?;
+    if entry.entity != "event" {
+        return Err(AppError::unprocessable(
+            "EVENT_UNDO_UNSUPPORTED",
+            "仅支持撤销活动变更",
+            vec![],
+        ));
+    }
+    let before = entry.before.clone().ok_or_else(|| {
+        AppError::unprocessable("EVENT_UNDO_UNSUPPORTED", "该记录不可撤销", vec![])
+    })?;
+    let event_id: Uuid = entry.entity_id.parse().map_err(AppError::internal)?;
+    let now = state.now();
+    if entry.action == "form" {
+        let schema = before.get("schema").cloned().unwrap_or(Value::Null);
+        if schema.is_null() {
+            return Err(AppError::unprocessable(
+                "EVENT_UNDO_UNSUPPORTED",
+                "该活动此前没有表单快照",
+                vec![],
+            ));
+        }
+        let model = repo::save_form_schema(&state.db, event_id, &schema, now).await?;
+        let _ = club_bus::audit::record(
+            &state.db,
+            "event",
+            &event_id.to_string(),
+            "undo",
+            Some(json!({ "schema": model.schema })),
+            None,
+            Some(user_id),
+            now,
+        )
+        .await;
+        let event_model = repo::find_event(&state.db, event_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("EVENT_NOT_FOUND", "活动不存在"))?;
+        return Ok(Json(event_dto(&event_model)));
+    }
+    let model = load_event_for_admin(&state, user_id, event_id).await?;
+    let after_snapshot = serde_json::to_value(event_dto(&model)).map_err(AppError::internal)?;
+    let title = before
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(&model.title)
+        .to_string();
+    let updated = repo::update_event(
+        &state.db,
+        &model,
+        Some(title),
+        snap_str(&before, "descriptionMd"),
+        Some(match before.get("location") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            _ => None,
+        }),
+        before.get("capacity").and_then(Value::as_i64),
+        before.get("waitlistEnabled").and_then(Value::as_bool),
+        before.get("needReview").and_then(Value::as_bool),
+        before.get("emailVerify").and_then(Value::as_bool),
+        before.get("emailDomains").and_then(Value::as_array).map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }),
+        snap_str(&before, "status"),
+        now,
+    )
+    .await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "event",
+        &updated.id.to_string(),
+        "undo",
+        Some(after_snapshot),
+        Some(serde_json::to_value(event_dto(&updated)).map_err(AppError::internal)?),
+        Some(user_id),
+        now,
+    )
+    .await;
+    Ok(Json(event_dto(&updated)))
+}
+
 /// `GET /events/{id}`。
 pub async fn get_event(
     State(state): State<SharedState>,
@@ -362,6 +476,7 @@ pub async fn update_event(
             ));
         }
     }
+    let before_snapshot = serde_json::to_value(event_dto(&model)).map_err(AppError::internal)?;
     let updated = repo::update_event(
         &state.db,
         &model,
@@ -377,6 +492,17 @@ pub async fn update_event(
         state.now(),
     )
     .await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "event",
+        &updated.id.to_string(),
+        "update",
+        Some(before_snapshot),
+        Some(serde_json::to_value(event_dto(&updated)).map_err(AppError::internal)?),
+        Some(user_id),
+        state.now(),
+    )
+    .await;
     Ok(Json(event_dto(&updated)))
 }
 
@@ -390,7 +516,21 @@ pub async fn put_form(
     let user_id = user_id_of(&auth)?;
     load_event_for_admin(&state, user_id, event_id).await?;
     domain::validate_form_schema(&schema)?;
+    let before_schema = repo::latest_form_schema(&state.db, event_id)
+        .await?
+        .map(|form| form.schema);
     let model = repo::save_form_schema(&state.db, event_id, &schema, state.now()).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "event",
+        &event_id.to_string(),
+        "form",
+        Some(json!({ "schema": before_schema })),
+        Some(json!({ "schema": model.schema })),
+        Some(user_id),
+        state.now(),
+    )
+    .await;
     Ok(Json(
         json!({ "version": model.version, "schema": model.schema }),
     ))
@@ -972,6 +1112,8 @@ pub async fn registration_status(
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/events", get(list_events).post(create_event))
+        .route("/events/{id}/changes", get(list_event_changes))
+        .route("/changes/{id}/undo", post(undo_change))
         .route("/events/{id}", get(get_event).patch(update_event))
         .route("/events/{id}/form", get(get_form).put(put_form))
         .route("/events/{id}/registrations", get(list_registrations))
